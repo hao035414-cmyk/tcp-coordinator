@@ -1,0 +1,14 @@
+# 编译中间产物
+bin/
+obj/
+*.pdb
+*.user
+*.suo
+.vs/
+
+# 本地日志
+*.log
+
+# 临时文件
+Thumbs.db
+desktop.ini
