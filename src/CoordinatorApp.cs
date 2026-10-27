@@ -516,13 +516,13 @@ namespace TcpCoordinatorApp
             get { return _running; }
         }
 
-        public void Connect(string host, int port, string name, string role)
+        public void Connect(string host, int port, string name, string role, int timeoutMs)
         {
             Disconnect();
 
             TcpClient tcp = new TcpClient();
             tcp.NoDelay = true;
-            tcp.Connect(host, port);
+            NetUtil.ConnectWithTimeout(tcp, host, port, timeoutMs);
 
             _tcp = tcp;
             NetworkStream stream = tcp.GetStream();
@@ -612,7 +612,147 @@ namespace TcpCoordinatorApp
     }
 
     // ------------------------------------------------------------------------
-    //  分段选择器：主机 / 加入 / 仅服务端
+    //  带超时的 TCP 连接（同步 Connect 在不可达地址上会阻塞 21 秒）
+    // ------------------------------------------------------------------------
+    internal static class NetUtil
+    {
+        public static void ConnectWithTimeout(TcpClient tcp, string host, int port, int timeoutMs)
+        {
+            IAsyncResult pending = tcp.BeginConnect(host, port, null, null);
+            if (!pending.AsyncWaitHandle.WaitOne(timeoutMs))
+            {
+                try
+                {
+                    tcp.Close();
+                }
+                catch (Exception)
+                {
+                }
+                throw new TimeoutException("连接超时（" + (timeoutMs / 1000) + " 秒），对方没有响应，检查 IP / 端口 / 防火墙");
+            }
+            tcp.EndConnect(pending);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    //  通用 TCP 客户端：不假设对端协议，原样收发字节
+    // ------------------------------------------------------------------------
+    internal sealed class RawClient : IDisposable
+    {
+        private TcpClient _tcp;
+        private NetworkStream _stream;
+        private Thread _thread;
+        private volatile bool _running;
+
+        public event Action<byte[]> DataReceived;
+        public event Action<string> Disconnected;
+
+        public bool Connected
+        {
+            get { return _running; }
+        }
+
+        public void Connect(string host, int port, int timeoutMs)
+        {
+            Disconnect();
+
+            TcpClient tcp = new TcpClient();
+            tcp.NoDelay = true;
+            NetUtil.ConnectWithTimeout(tcp, host, port, timeoutMs);
+
+            _tcp = tcp;
+            _stream = tcp.GetStream();
+            _running = true;
+
+            _thread = new Thread(ReadLoop);
+            _thread.IsBackground = true;
+            _thread.Name = "raw-rx";
+            _thread.Start();
+        }
+
+        private void ReadLoop()
+        {
+            string reason = "连接已关闭";
+            byte[] buffer = new byte[8192];
+
+            try
+            {
+                while (_running)
+                {
+                    int read = _stream.Read(buffer, 0, buffer.Length);
+                    if (read <= 0)
+                    {
+                        reason = "对端关闭连接";
+                        break;
+                    }
+
+                    byte[] chunk = new byte[read];
+                    Buffer.BlockCopy(buffer, 0, chunk, 0, read);
+
+                    Action<byte[]> handler = DataReceived;
+                    if (handler != null)
+                    {
+                        handler(chunk);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                reason = ex.Message;
+            }
+
+            _running = false;
+            Action<string> closed = Disconnected;
+            if (closed != null)
+            {
+                closed(reason);
+            }
+        }
+
+        public bool Send(byte[] data)
+        {
+            try
+            {
+                NetworkStream stream = _stream;
+                if (stream == null || !_running)
+                {
+                    return false;
+                }
+                stream.Write(data, 0, data.Length);
+                stream.Flush();
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        public void Disconnect()
+        {
+            _running = false;
+            try
+            {
+                if (_tcp != null)
+                {
+                    _tcp.Close();
+                }
+            }
+            catch (Exception)
+            {
+            }
+            _tcp = null;
+            _stream = null;
+        }
+
+        public void Dispose()
+        {
+            Disconnect();
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    //  分段选择器：主机 / 加入 / 仅服务端 / 通用TCP
     // ------------------------------------------------------------------------
     internal sealed class Segmented : Control
     {
@@ -723,6 +863,12 @@ namespace TcpCoordinatorApp
         private readonly List<KeyValuePair<string, string>> _board = new List<KeyValuePair<string, string>>();
 
         private CoordClient _client;
+        private RawClient _raw;
+        private bool _rawConnected;
+        private bool _connecting;
+        private int _connectAttempt;
+        private long _rawBytesIn;
+        private long _rawBytesOut;
         private Coordinator _server;
         private CancellationTokenSource _serverCts;
         private Thread _serverThread;
@@ -757,6 +903,8 @@ namespace TcpCoordinatorApp
         private RichTextBox _chat;
         private Card _composerCard;
         private ComboBox _target;
+        private ComboBox _lineEnding;
+        private ComboBox _sendFormat;
         private Field _input;
         private PillButton _btnSend;
 
@@ -920,7 +1068,7 @@ namespace TcpCoordinatorApp
             Controls.Add(_connectCard);
 
             _mode = new Segmented();
-            _mode.SetItems("主机", "加入", "仅服务端");
+            _mode.SetItems("主机", "加入", "仅服务端", "通用TCP");
             _connectCard.Controls.Add(_mode);
 
             _fHost = NewField("127.0.0.1", "地址");
@@ -1003,6 +1151,14 @@ namespace TcpCoordinatorApp
             _target.DrawItem += DrawTarget;
             _composerCard.Controls.Add(_target);
 
+            _lineEnding = NewCombo(new string[] { "行尾:无", "行尾:LF", "行尾:CRLF" });
+            _lineEnding.Visible = false;
+            _composerCard.Controls.Add(_lineEnding);
+
+            _sendFormat = NewCombo(new string[] { "文本", "HEX" });
+            _sendFormat.Visible = false;
+            _composerCard.Controls.Add(_sendFormat);
+
             _input = NewField(string.Empty, "说点什么，回车发送");
             _composerCard.Controls.Add(_input);
 
@@ -1052,6 +1208,22 @@ namespace TcpCoordinatorApp
 
             ApplyMode();
             RebuildTargets();
+        }
+
+        private ComboBox NewCombo(string[] items)
+        {
+            ComboBox combo = new ComboBox();
+            combo.DropDownStyle = ComboBoxStyle.DropDownList;
+            combo.FlatStyle = FlatStyle.Flat;
+            combo.BackColor = Theme.Input;
+            combo.ForeColor = Theme.Text;
+            combo.Font = Theme.Ui;
+            combo.DrawMode = DrawMode.OwnerDrawFixed;
+            combo.ItemHeight = 22;
+            combo.DrawItem += DrawTarget;
+            combo.Items.AddRange(items);
+            combo.SelectedIndex = 0;
+            return combo;
         }
 
         private Field NewField(string text, string cue)
@@ -1147,8 +1319,12 @@ namespace TcpCoordinatorApp
 
             _composerCard.SetBounds(centerX, bodyTop + _chatCard.Height + gap, centerW, S(72));
             int sendW = S(96);
+            bool rawComposer = _mode != null && _mode.SelectedIndex == 3;
             _target.SetBounds(S(14), S(20), S(132), S(32));
-            _input.SetBounds(S(158), S(18), Math.Max(S(90), centerW - S(158 + 14) - sendW - S(12)), S(36));
+            _lineEnding.SetBounds(S(14), S(20), S(96), S(32));
+            _sendFormat.SetBounds(S(118), S(20), S(92), S(32));
+            int inputX = rawComposer ? S(222) : S(158);
+            _input.SetBounds(inputX, S(18), Math.Max(S(90), centerW - inputX - S(14) - sendW - S(12)), S(36));
             _btnSend.SetBounds(centerW - S(14) - sendW, S(18), sendW, S(36));
 
             int lockH = (contentBottom - bodyTop - gap) / 2;
@@ -1295,6 +1471,276 @@ namespace TcpCoordinatorApp
             });
         }
 
+        // ---------------------------------------------------------------- 通用 TCP
+
+        private void ConnectRaw()
+        {
+            string host = _fHost.Text.Trim();
+            int port;
+
+            if (host.Length == 0)
+            {
+                SetStatus("请填写对方地址", Theme.Warn);
+                return;
+            }
+            if (!int.TryParse(_fPort.Text.Trim(), out port) || port < 1 || port > 65535)
+            {
+                SetStatus("端口需要 1~65535 之间的数字", Theme.Warn);
+                return;
+            }
+
+            if (_raw != null)
+            {
+                _raw.Dispose();
+                _raw = null;
+            }
+
+            if (_connecting)
+            {
+                return;
+            }
+
+            int attempt = ++_connectAttempt;
+            _connecting = true;
+            _btnAction.Enabled = false;
+            _btnAction.Text = "连接中…";
+            SetStatus("正在连接 " + host + ":" + port + " ……", Theme.Accent);
+
+            string hostArg = host;
+            int portArg = port;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                RawClient raw = new RawClient();
+                Exception failure = null;
+                try
+                {
+                    raw.Connect(hostArg, portArg, 6000);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                    raw.Dispose();
+                    raw = null;
+                }
+
+                BeginInvoke((Action)delegate
+                {
+                    if (attempt != _connectAttempt)
+                    {
+                        if (raw != null)
+                        {
+                            raw.Dispose();
+                        }
+                        return;
+                    }
+                    FinishRawConnect(raw, failure, hostArg, portArg);
+                });
+            });
+        }
+
+        private void FinishRawConnect(RawClient raw, Exception failure, string host, int port)
+        {
+            _connecting = false;
+            _btnAction.Enabled = true;
+
+            if (failure != null)
+            {
+                UpdateActionButton();
+                SetStatus("连接失败：" + failure.Message, Theme.Bad);
+                return;
+            }
+
+            raw.DataReceived += delegate(byte[] data)
+            {
+                BeginInvoke((Action)delegate { OnRawData(data); });
+            };
+            raw.Disconnected += delegate(string reason)
+            {
+                BeginInvoke((Action)delegate
+                {
+                    if (_raw == raw)
+                    {
+                        DisconnectRaw("连接断开：" + reason);
+                    }
+                });
+            };
+
+            _raw = raw;
+            _rawConnected = true;
+            _rawBytesIn = 0;
+            _rawBytesOut = 0;
+            UpdateActionButton();
+            _status.Set("已连接", Theme.Good);
+            SetStatus("已连接 " + host + ":" + port, Theme.Good);
+            AppendSystem("已连接到 " + host + ":" + port + "（通用 TCP 直连）");
+            UpdateRawState();
+        }
+
+        private void DisconnectRaw(string message)
+        {
+            if (_raw != null)
+            {
+                _raw.Dispose();
+                _raw = null;
+            }
+            _rawConnected = false;
+            UpdateActionButton();
+            _status.Set("未连接", Theme.Faint);
+            if (!string.IsNullOrEmpty(message))
+            {
+                AppendSystem(message);
+                SetStatus(message, Theme.Muted);
+            }
+        }
+
+        private void OnRawData(byte[] data)
+        {
+            _rawBytesIn += data.Length;
+            AppendRawChunk(data);
+            UpdateRawState();
+        }
+
+        private void UpdateRawState()
+        {
+            if (_mode != null && _mode.SelectedIndex == 3)
+            {
+                _serverState.Text = "收 " + _rawBytesIn.ToString(CultureInfo.InvariantCulture)
+                    + " 字节 / 发 " + _rawBytesOut.ToString(CultureInfo.InvariantCulture) + " 字节";
+                _serverState.ForeColor = _rawConnected ? Theme.Good : Theme.Faint;
+            }
+        }
+
+        private void AppendRawChunk(byte[] data)
+        {
+            if (data == null || data.Length == 0)
+            {
+                return;
+            }
+
+            int printable = 0;
+            foreach (byte b in data)
+            {
+                if (b == 9 || b == 10 || b == 13 || b >= 32)
+                {
+                    printable++;
+                }
+            }
+
+            if (printable * 100 / data.Length >= 70)
+            {
+                AppendRun(Encoding.UTF8.GetString(data), Theme.Ui, Theme.Text);
+            }
+            else
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("[收到 ").Append(data.Length.ToString(CultureInfo.InvariantCulture)).Append(" 字节 HEX] ");
+                for (int i = 0; i < data.Length; i++)
+                {
+                    sb.Append(data[i].ToString("X2", CultureInfo.InvariantCulture)).Append(' ');
+                }
+                sb.Append('\n');
+                AppendRun(sb.ToString(), Theme.Small, Theme.Muted);
+            }
+            ScrollChat();
+        }
+
+        private string LineEndingText()
+        {
+            switch (_lineEnding.SelectedIndex)
+            {
+                case 1: return "\n";
+                case 2: return "\r\n";
+                default: return string.Empty;
+            }
+        }
+
+        private static byte[] ParseHex(string text)
+        {
+            StringBuilder cleaned = new StringBuilder();
+            foreach (char ch in text)
+            {
+                if (ch == ' ' || ch == ',' || ch == '-' || ch == '\t')
+                {
+                    continue;
+                }
+                cleaned.Append(ch);
+            }
+            if (cleaned.Length == 0 || cleaned.Length % 2 != 0)
+            {
+                return null;
+            }
+
+            byte[] bytes = new byte[cleaned.Length / 2];
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                int value;
+                if (!int.TryParse(cleaned.ToString(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value))
+                {
+                    return null;
+                }
+                bytes[i] = (byte)value;
+            }
+            return bytes;
+        }
+
+        private void SendRawNow()
+        {
+            if (!_rawConnected)
+            {
+                SetStatus("还没有连接", Theme.Warn);
+                return;
+            }
+
+            string text = _input.Text;
+            if (text.Length == 0)
+            {
+                return;
+            }
+
+            bool hex = _sendFormat.SelectedIndex == 1;
+            byte[] payload;
+            if (hex)
+            {
+                payload = ParseHex(text);
+                if (payload == null)
+                {
+                    SetStatus("HEX 格式不对，示例：48 65 6C 6C 6F", Theme.Warn);
+                    return;
+                }
+            }
+            else
+            {
+                payload = Encoding.UTF8.GetBytes(text + LineEndingText());
+            }
+
+            if (!_raw.Send(payload))
+            {
+                SetStatus("发送失败", Theme.Bad);
+                return;
+            }
+
+            _rawBytesOut += payload.Length;
+            AppendRun(DateTime.Now.ToString("HH:mm", CultureInfo.InvariantCulture) + "  ", Theme.Small, Theme.Faint);
+            AppendRun("→ ", Theme.Small, Theme.Accent);
+            AppendRun(hex ? FormatHex(payload) : text, Theme.Ui, Theme.Self);
+            AppendRun("\n", Theme.Ui, Theme.Text);
+            ScrollChat();
+            UpdateRawState();
+            _input.Text = string.Empty;
+            _input.Box.Focus();
+        }
+
+        private static string FormatHex(byte[] data)
+        {
+            StringBuilder sb = new StringBuilder(data.Length * 3);
+            foreach (byte b in data)
+            {
+                sb.Append(b.ToString("X2", CultureInfo.InvariantCulture)).Append(' ');
+            }
+            return sb.ToString().TrimEnd();
+        }
+
         // ---------------------------------------------------------------- 客户端
 
         private string ModeName()
@@ -1303,12 +1749,17 @@ namespace TcpCoordinatorApp
             {
                 case 0: return "主机";
                 case 1: return "加入";
-                default: return "仅服务端";
+                case 2: return "仅服务端";
+                default: return "通用TCP";
             }
         }
 
         private void OnModeChanged()
         {
+            _connectAttempt++;
+            _connecting = false;
+            _btnAction.Enabled = true;
+
             if (_server != null)
             {
                 StopServer();
@@ -1317,6 +1768,10 @@ namespace TcpCoordinatorApp
             {
                 DoDisconnect(null);
             }
+            if (_raw != null)
+            {
+                DisconnectRaw(null);
+            }
             ApplyMode();
             SetStatus("已切换到「" + ModeName() + "」模式", Theme.Muted);
         }
@@ -1324,9 +1779,9 @@ namespace TcpCoordinatorApp
         private void RefreshFieldStates()
         {
             int mode = _mode.SelectedIndex;
-            _fHost.EnabledVisual = mode == 1;
-            _fName.EnabledVisual = mode != 2;
-            _fRole.EnabledVisual = mode != 2;
+            _fHost.EnabledVisual = mode == 1 || mode == 3;
+            _fName.EnabledVisual = mode != 2 && mode != 3;
+            _fRole.EnabledVisual = mode != 2 && mode != 3;
             _fPort.EnabledVisual = _server == null;
         }
 
@@ -1334,6 +1789,13 @@ namespace TcpCoordinatorApp
         {
             int mode = _mode.SelectedIndex;
             RefreshFieldStates();
+
+            bool raw = mode == 3;
+            _target.Visible = !raw;
+            _lineEnding.Visible = raw;
+            _sendFormat.Visible = raw;
+            _btnLocks.Enabled = !raw;
+            _btnBoard.Enabled = !raw;
 
             if (mode == 0)
             {
@@ -1344,17 +1806,68 @@ namespace TcpCoordinatorApp
             {
                 _hint.Text = "填对方的 IP 和端口，加入它。";
             }
-            else
+            else if (mode == 2)
             {
                 _hint.Text = "只监听端口，不以成员身份上线。";
             }
+            else
+            {
+                _fHost.Text = _fHost.Text.Trim().Length == 0 ? "127.0.0.1" : _fHost.Text;
+                _hint.Text = "连任意 TCP 服务，不假设协议，文本或 HEX 原样收发。";
+            }
+
+            if (raw)
+            {
+                _membersCard.Caption = "通用 TCP 模式不适用";
+                _locksCard.Caption = "通用 TCP 模式不适用";
+                _boardCard.Caption = "通用 TCP 模式不适用";
+                _memberList.Items.Clear();
+                _lockList.Items.Clear();
+                _boardList.Items.Clear();
+                if (_emptyMembers != null)
+                {
+                    _emptyMembers.Visible = false;
+                }
+                UpdateRawState();
+            }
+            else
+            {
+                _membersCard.Caption = string.Empty;
+                _locksCard.Caption = string.Empty;
+                _boardCard.Caption = string.Empty;
+                if (_server == null)
+                {
+                    _serverState.Text = "服务未启动";
+                    _serverState.ForeColor = Theme.Faint;
+                }
+                else
+                {
+                    _serverState.Text = "服务运行中 · 端口 " + _serverPort.ToString(CultureInfo.InvariantCulture);
+                    _serverState.ForeColor = Theme.Good;
+                }
+                if (_emptyMembers != null)
+                {
+                    _emptyMembers.Visible = _members.Count == 0;
+                }
+            }
 
             UpdateActionButton();
+            if (IsHandleCreated)
+            {
+                LayoutAll();
+            }
         }
 
         private void UpdateActionButton()
         {
             int mode = _mode.SelectedIndex;
+
+            if (mode == 3)
+            {
+                _btnAction.Text = _rawConnected ? "断开" : "连接";
+                _btnAction.Style = _rawConnected ? PillButton.Kind.Secondary : PillButton.Kind.Primary;
+                return;
+            }
 
             if (mode == 2)
             {
@@ -1374,7 +1887,25 @@ namespace TcpCoordinatorApp
 
         private void OnActionClicked()
         {
+            if (_connecting)
+            {
+                return;
+            }
+
             int mode = _mode.SelectedIndex;
+
+            if (mode == 3)
+            {
+                if (_rawConnected)
+                {
+                    DisconnectRaw("已断开");
+                }
+                else
+                {
+                    ConnectRaw();
+                }
+                return;
+            }
 
             if (mode == 2)
             {
@@ -1419,6 +1950,11 @@ namespace TcpCoordinatorApp
 
         private void DoConnect()
         {
+            if (_connecting)
+            {
+                return;
+            }
+
             string host = _fHost.Text.Trim();
             int port;
             string name = _fName.Text.Trim();
@@ -1450,7 +1986,59 @@ namespace TcpCoordinatorApp
                 _client = null;
             }
 
-            CoordClient client = new CoordClient();
+            int attempt = ++_connectAttempt;
+            _connecting = true;
+            _btnAction.Enabled = false;
+            _btnAction.Text = "连接中…";
+            SetStatus("正在连接 " + host + ":" + port + " ……", Theme.Accent);
+
+            string hostArg = host;
+            int portArg = port;
+            string nameArg = name;
+            string roleArg = role;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                CoordClient client = new CoordClient();
+                Exception failure = null;
+                try
+                {
+                    client.Connect(hostArg, portArg, nameArg, roleArg, 6000);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                    client.Dispose();
+                    client = null;
+                }
+
+                BeginInvoke((Action)delegate
+                {
+                    if (attempt != _connectAttempt)
+                    {
+                        if (client != null)
+                        {
+                            client.Dispose();
+                        }
+                        return;
+                    }
+                    FinishConnect(client, failure, hostArg, portArg, nameArg, roleArg);
+                });
+            });
+        }
+
+        private void FinishConnect(CoordClient client, Exception failure, string host, int port, string name, string role)
+        {
+            _connecting = false;
+            _btnAction.Enabled = true;
+
+            if (failure != null)
+            {
+                UpdateActionButton();
+                SetStatus("连接失败：" + failure.Message, Theme.Bad);
+                return;
+            }
+
             client.LineReceived += delegate(string line)
             {
                 BeginInvoke((Action)delegate { HandleServerLine(line); });
@@ -1465,17 +2053,6 @@ namespace TcpCoordinatorApp
                     }
                 });
             };
-
-            try
-            {
-                client.Connect(host, port, name, role);
-            }
-            catch (Exception ex)
-            {
-                client.Dispose();
-                SetStatus("连接失败：" + ex.Message + "（先确认对方已点「启动并连接」，且端口一致）", Theme.Bad);
-                return;
-            }
 
             _client = client;
             _selfName = name;
@@ -1533,6 +2110,11 @@ namespace TcpCoordinatorApp
                 _client.Dispose();
                 _client = null;
             }
+            if (_raw != null)
+            {
+                _raw.Dispose();
+                _raw = null;
+            }
             try
             {
                 if (_serverCts != null)
@@ -1564,7 +2146,7 @@ namespace TcpCoordinatorApp
 
         private void RefreshFromServer()
         {
-            if (!_connected)
+            if (!_connected || _mode.SelectedIndex == 3)
             {
                 return;
             }
@@ -1784,6 +2366,12 @@ namespace TcpCoordinatorApp
 
         private void SendMessageNow()
         {
+            if (_mode.SelectedIndex == 3)
+            {
+                SendRawNow();
+                return;
+            }
+
             if (!_connected)
             {
                 SetStatus("还没有连接", Theme.Warn);
@@ -1978,7 +2566,8 @@ namespace TcpCoordinatorApp
 
         private void DrawTarget(object sender, DrawItemEventArgs e)
         {
-            if (e.Index < 0 || e.Index >= _target.Items.Count)
+            ComboBox combo = sender as ComboBox;
+            if (combo == null || e.Index < 0 || e.Index >= combo.Items.Count)
             {
                 return;
             }
@@ -1987,7 +2576,7 @@ namespace TcpCoordinatorApp
             {
                 e.Graphics.FillRectangle(brush, e.Bounds);
             }
-            TextRenderer.DrawText(e.Graphics, _target.Items[e.Index].ToString(), Theme.Ui,
+            TextRenderer.DrawText(e.Graphics, combo.Items[e.Index].ToString(), Theme.Ui,
                                   new Rectangle(e.Bounds.X + S(6), e.Bounds.Y, e.Bounds.Width - S(8), e.Bounds.Height),
                                   Theme.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
