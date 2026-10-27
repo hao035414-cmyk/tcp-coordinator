@@ -70,6 +70,38 @@ dist\TcpCoordinator.exe --port 9000
 dist\TcpCoordinator.exe --connect 127.0.0.1:9000 --name alice --role worker
 ```
 
+## 三种工作模式
+
+界面顶部有一个模式切换，决定这台机器扮演什么角色：
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| **主机** | 本机监听端口，并以填写的名字自动上线 | 一台机器当会合点，别人连过来 |
+| **加入** | 只作为客户端连到别人的地址 | 加入已有的协调中枢 |
+| **仅服务端** | 只监听端口，不以成员身份上线 | 后台常驻的纯中枢，自己用命令行或别的程序连 |
+
+主机模式下地址固定为 `127.0.0.1`、端口在服务运行期间会**锁定不可改**——避免"界面上的端口"和"实际监听的端口"不一致这种坑。
+
+## 连不上怎么排查
+
+`由于目标计算机积极拒绝，无法连接` 表示**对端端口上没有程序在监听**（不是防火墙拦截，防火墙通常是超时）。按顺序核对：
+
+```powershell
+# 1. 主机端确认真的在监听（应看到 0.0.0.0:<端口>）
+Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq 9000
+
+# 2. 拿局域网 IP（别人要填这个，不是 127.0.0.1）
+ipconfig | Select-String 'IPv4'
+
+# 3. 主机端放行防火墙（管理员 PowerShell，仅一次）
+netsh advfirewall firewall add rule name="TCP协调助手" dir=in action=allow protocol=TCP localport=9000
+
+# 4. 客户端侧先探通不通，TcpTestSucceeded 必须为 True
+Test-NetConnection 对方IP -Port 9000
+```
+
+第 4 步不通就说明 1~3 有问题，此时在界面里点「连接」只会得到同一个错误。
+
 ## 用任何语言接进来
 
 协议是 **UTF-8 文本行**，一行一条命令，用 `netcat` 或者任意语言的 socket 都能说：

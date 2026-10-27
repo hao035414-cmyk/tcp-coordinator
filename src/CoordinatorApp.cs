@@ -384,6 +384,20 @@ namespace TcpCoordinatorApp
             set { Box.Text = value; }
         }
 
+        private bool _enabledVisual = true;
+
+        public bool EnabledVisual
+        {
+            get { return _enabledVisual; }
+            set
+            {
+                _enabledVisual = value;
+                Box.Enabled = value;
+                Box.ForeColor = value ? Theme.Text : Theme.Faint;
+                Invalidate();
+            }
+        }
+
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -412,9 +426,11 @@ namespace TcpCoordinatorApp
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+            Color fillColor = _enabledVisual ? Theme.Input : Color.FromArgb(19, 24, 31);
+            Color lineColor = !_enabledVisual ? Theme.CardBorder : (Box.Focused ? Theme.Accent : Theme.InputBorder);
             using (GraphicsPath path = Gfx.Round(r, 9))
-            using (SolidBrush fill = new SolidBrush(Theme.Input))
-            using (Pen pen = new Pen(Box.Focused ? Theme.Accent : Theme.InputBorder))
+            using (SolidBrush fill = new SolidBrush(fillColor))
+            using (Pen pen = new Pen(lineColor))
             {
                 g.FillPath(fill, path);
                 g.DrawPath(pen, path);
@@ -596,6 +612,104 @@ namespace TcpCoordinatorApp
     }
 
     // ------------------------------------------------------------------------
+    //  分段选择器：主机 / 加入 / 仅服务端
+    // ------------------------------------------------------------------------
+    internal sealed class Segmented : Control
+    {
+        private string[] _items = new string[0];
+        private int _selected;
+
+        public event EventHandler SelectionChanged;
+
+        public Segmented()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.Card;
+            Cursor = Cursors.Hand;
+            Font = Theme.SmallBold;
+        }
+
+        public void SetItems(params string[] items)
+        {
+            _items = items ?? new string[0];
+            _selected = 0;
+            Invalidate();
+        }
+
+        public int SelectedIndex
+        {
+            get { return _selected; }
+            set
+            {
+                if (_items.Length == 0)
+                {
+                    return;
+                }
+                int next = Math.Max(0, Math.Min(_items.Length - 1, value));
+                if (next == _selected)
+                {
+                    return;
+                }
+                _selected = next;
+                Invalidate();
+                EventHandler handler = SelectionChanged;
+                if (handler != null)
+                {
+                    handler(this, EventArgs.Empty);
+                }
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (_items.Length > 0)
+            {
+                int width = Math.Max(1, Width / _items.Length);
+                SelectedIndex = e.X / width;
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+
+            using (GraphicsPath path = Gfx.Round(r, 9))
+            using (SolidBrush fill = new SolidBrush(Theme.Input))
+            using (Pen pen = new Pen(Theme.InputBorder))
+            {
+                g.FillPath(fill, path);
+                g.DrawPath(pen, path);
+            }
+
+            if (_items.Length == 0)
+            {
+                return;
+            }
+
+            int segWidth = Width / _items.Length;
+            for (int i = 0; i < _items.Length; i++)
+            {
+                Rectangle seg = new Rectangle(i * segWidth + 3, 3, segWidth - 6, Height - 6);
+                if (i == _selected)
+                {
+                    using (GraphicsPath p = Gfx.Round(seg, 7))
+                    using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    {
+                        g.FillPath(b, p);
+                    }
+                }
+                Color color = i == _selected ? Color.White : Theme.Muted;
+                TextRenderer.DrawText(g, _items[i], Font, seg, color,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
     //  主窗口
     // ------------------------------------------------------------------------
     internal sealed class MainForm : Form
@@ -630,8 +744,8 @@ namespace TcpCoordinatorApp
         private Field _fPort;
         private Field _fName;
         private Field _fRole;
-        private PillButton _btnServe;
-        private PillButton _btnConnect;
+        private Segmented _mode;
+        private PillButton _btnAction;
         private Label _hint;
         private Label _serverState;
 
@@ -805,6 +919,10 @@ namespace TcpCoordinatorApp
             _connectCard.Title = "连接";
             Controls.Add(_connectCard);
 
+            _mode = new Segmented();
+            _mode.SetItems("主机", "加入", "仅服务端");
+            _connectCard.Controls.Add(_mode);
+
             _fHost = NewField("127.0.0.1", "地址");
             _fPort = NewField("9000", "端口");
             _fName = NewField("alice", "名字");
@@ -814,15 +932,10 @@ namespace TcpCoordinatorApp
             _connectCard.Controls.Add(_fName);
             _connectCard.Controls.Add(_fRole);
 
-            _btnServe = new PillButton();
-            _btnServe.Text = "启动服务";
-            _btnServe.Style = PillButton.Kind.Secondary;
-            _connectCard.Controls.Add(_btnServe);
-
-            _btnConnect = new PillButton();
-            _btnConnect.Text = "连接";
-            _btnConnect.Style = PillButton.Kind.Primary;
-            _connectCard.Controls.Add(_btnConnect);
+            _btnAction = new PillButton();
+            _btnAction.Text = "启动并连接";
+            _btnAction.Style = PillButton.Kind.Primary;
+            _connectCard.Controls.Add(_btnAction);
 
             _hint = new Label();
             _hint.AutoSize = false;
@@ -937,6 +1050,7 @@ namespace TcpCoordinatorApp
             _statusText.BackColor = Theme.Bg;
             Controls.Add(_statusText);
 
+            ApplyMode();
             RebuildTargets();
         }
 
@@ -961,8 +1075,8 @@ namespace TcpCoordinatorApp
 
         private void HookEvents()
         {
-            _btnConnect.Click += delegate { ToggleConnect(); };
-            _btnServe.Click += delegate { ToggleServer(); };
+            _btnAction.Click += delegate { OnActionClicked(); };
+            _mode.SelectionChanged += delegate { OnModeChanged(); };
             _btnSend.Click += delegate { SendMessageNow(); };
             _btnLocks.Click += delegate { SendLine("LOCKS"); };
             _btnBoard.Click += delegate { SendLine("BOARD"); };
@@ -1013,14 +1127,14 @@ namespace TcpCoordinatorApp
             _connectCard.SetBounds(leftX, bodyTop, leftW, connectH);
 
             int cw = leftW;
-            _fHost.SetBounds(S(18), S(60), S(160), S(36));
-            _fPort.SetBounds(S(186), S(60), cw - S(186 + 18), S(36));
-            _fName.SetBounds(S(18), S(106), S(160), S(36));
-            _fRole.SetBounds(S(186), S(106), cw - S(186 + 18), S(36));
-            _btnServe.SetBounds(S(18), S(156), S(128), S(38));
-            _btnConnect.SetBounds(S(154), S(156), cw - S(154 + 18), S(38));
-            _hint.SetBounds(S(18), S(206), cw - S(36), S(38));
-            _serverState.SetBounds(S(18), S(248), cw - S(36), S(26));
+            _mode.SetBounds(S(18), S(46), cw - S(36), S(36));
+            _fHost.SetBounds(S(18), S(94), S(160), S(36));
+            _fPort.SetBounds(S(186), S(94), cw - S(186 + 18), S(36));
+            _fName.SetBounds(S(18), S(138), S(160), S(36));
+            _fRole.SetBounds(S(186), S(138), cw - S(186 + 18), S(36));
+            _btnAction.SetBounds(S(18), S(186), cw - S(36), S(40));
+            _hint.SetBounds(S(18), S(236), cw - S(36), S(24));
+            _serverState.SetBounds(S(18), S(262), cw - S(36), S(24));
 
             int membersTop = bodyTop + connectH + gap;
             _membersCard.SetBounds(leftX, membersTop, leftW, Math.Max(S(160), contentBottom - membersTop));
@@ -1052,7 +1166,7 @@ namespace TcpCoordinatorApp
 
         // ---------------------------------------------------------------- 服务端
 
-        private void ToggleServer()
+        private void StartServer(bool autoConnect)
         {
             if (_server != null)
             {
@@ -1090,6 +1204,7 @@ namespace TcpCoordinatorApp
             }
 
             _serverPort = port;
+            _fPort.Text = port.ToString(CultureInfo.InvariantCulture);
             _serverThread = new Thread(delegate()
             {
                 try
@@ -1108,23 +1223,27 @@ namespace TcpCoordinatorApp
             _serverThread.Name = "coord-server";
             _serverThread.Start();
 
-            _btnServe.Text = "停止服务";
+            RefreshFieldStates();
+            UpdateActionButton();
             _serverState.Text = "服务运行中 · 端口 " + port;
             _serverState.ForeColor = Theme.Good;
-            SetStatus("服务已启动，正在连接本机…", Theme.Accent);
+            SetStatus(autoConnect ? "服务已启动，正在连接本机…" : "服务已启动，等待客户端接入", Theme.Accent);
 
-            ThreadPool.QueueUserWorkItem(delegate
+            if (autoConnect)
             {
-                Thread.Sleep(350);
-                BeginInvoke((Action)delegate
+                ThreadPool.QueueUserWorkItem(delegate
                 {
-                    _fHost.Text = "127.0.0.1";
-                    if (!_connected)
+                    Thread.Sleep(350);
+                    BeginInvoke((Action)delegate
                     {
-                        DoConnect();
-                    }
+                        _fHost.Text = "127.0.0.1";
+                        if (!_connected)
+                        {
+                            DoConnect();
+                        }
+                    });
                 });
-            });
+            }
         }
 
         private void StopServer()
@@ -1167,9 +1286,10 @@ namespace TcpCoordinatorApp
                         _serverCts.Dispose();
                         _serverCts = null;
                     }
-                    _btnServe.Text = "启动服务";
                     _serverState.Text = "服务未启动";
                     _serverState.ForeColor = Theme.Faint;
+                    RefreshFieldStates();
+                    UpdateActionButton();
                     SetStatus("服务已停止", Theme.Muted);
                 });
             });
@@ -1177,14 +1297,124 @@ namespace TcpCoordinatorApp
 
         // ---------------------------------------------------------------- 客户端
 
-        private void ToggleConnect()
+        private string ModeName()
         {
+            switch (_mode.SelectedIndex)
+            {
+                case 0: return "主机";
+                case 1: return "加入";
+                default: return "仅服务端";
+            }
+        }
+
+        private void OnModeChanged()
+        {
+            if (_server != null)
+            {
+                StopServer();
+            }
+            if (_connected)
+            {
+                DoDisconnect(null);
+            }
+            ApplyMode();
+            SetStatus("已切换到「" + ModeName() + "」模式", Theme.Muted);
+        }
+
+        private void RefreshFieldStates()
+        {
+            int mode = _mode.SelectedIndex;
+            _fHost.EnabledVisual = mode == 1;
+            _fName.EnabledVisual = mode != 2;
+            _fRole.EnabledVisual = mode != 2;
+            _fPort.EnabledVisual = _server == null;
+        }
+
+        private void ApplyMode()
+        {
+            int mode = _mode.SelectedIndex;
+            RefreshFieldStates();
+
+            if (mode == 0)
+            {
+                _fHost.Text = "127.0.0.1";
+                _hint.Text = "本机开服务并自动上线，别人填你的 IP 连进来。";
+            }
+            else if (mode == 1)
+            {
+                _hint.Text = "填对方的 IP 和端口，加入它。";
+            }
+            else
+            {
+                _hint.Text = "只监听端口，不以成员身份上线。";
+            }
+
+            UpdateActionButton();
+        }
+
+        private void UpdateActionButton()
+        {
+            int mode = _mode.SelectedIndex;
+
+            if (mode == 2)
+            {
+                _btnAction.Text = _server != null ? "停止服务" : "启动服务";
+            }
+            else if (mode == 0)
+            {
+                _btnAction.Text = _server != null ? "停止" : "启动并连接";
+            }
+            else
+            {
+                _btnAction.Text = _connected ? "断开" : "连接";
+            }
+
+            _btnAction.Style = (_server != null || _connected) ? PillButton.Kind.Secondary : PillButton.Kind.Primary;
+        }
+
+        private void OnActionClicked()
+        {
+            int mode = _mode.SelectedIndex;
+
+            if (mode == 2)
+            {
+                if (_server != null)
+                {
+                    StopServer();
+                }
+                else
+                {
+                    StartServer(false);
+                }
+                return;
+            }
+
+            if (mode == 0)
+            {
+                if (_server != null)
+                {
+                    StopServer();
+                    if (_connected)
+                    {
+                        DoDisconnect("已停止");
+                    }
+                }
+                else
+                {
+                    _fHost.Text = "127.0.0.1";
+                    StartServer(true);
+                }
+                return;
+            }
+
             if (_connected)
             {
                 DoDisconnect("已断开");
-                return;
             }
-            DoConnect();
+            else
+            {
+                DoConnect();
+            }
         }
 
         private void DoConnect()
@@ -1243,7 +1473,7 @@ namespace TcpCoordinatorApp
             catch (Exception ex)
             {
                 client.Dispose();
-                SetStatus("连接失败：" + ex.Message, Theme.Bad);
+                SetStatus("连接失败：" + ex.Message + "（先确认对方已点「启动并连接」，且端口一致）", Theme.Bad);
                 return;
             }
 
@@ -1251,8 +1481,7 @@ namespace TcpCoordinatorApp
             _selfName = name;
             _selfRole = role;
             _connected = true;
-            _btnConnect.Text = "断开";
-            _btnConnect.Style = PillButton.Kind.Secondary;
+            UpdateActionButton();
             _status.Set("已连接", Theme.Good);
             AppendSystem("已连接到 " + host + ":" + port + "，身份 " + name + "（" + role + "）");
             SetStatus("已连接 " + host + ":" + port, Theme.Good);
@@ -1270,8 +1499,7 @@ namespace TcpCoordinatorApp
                 _client = null;
             }
             _connected = false;
-            _btnConnect.Text = "连接";
-            _btnConnect.Style = PillButton.Kind.Primary;
+            UpdateActionButton();
             _status.Set("未连接", Theme.Faint);
             _members.Clear();
             _memberList.Items.Clear();
